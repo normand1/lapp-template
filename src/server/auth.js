@@ -6,11 +6,22 @@ const assert = require("assert");
 const crypto = require("crypto");
 const lnurl = require("lnurl");
 const qrcode = require("qrcode");
+const querystring = require('querystring');
 
 const map = {
   user: new Map(),
   session: new Map(),
 };
+
+const config = {
+	host: 'localhost',
+	port: 3000,
+	url: null,
+};
+
+if (!config.url) {
+	config.url = 'http://' + config.host + ':' + config.port;
+}
 
 function setupAuth(app) {
   app.use(
@@ -20,6 +31,10 @@ function setupAuth(app) {
       saveUninitialized: true,
     })
   );
+
+  
+  app.use(passport.initialize());
+  app.use(passport.session());
 
   passport.use(
     new lnurlAuth.Strategy(function (linkingPublicKey, done) {
@@ -31,10 +46,7 @@ function setupAuth(app) {
       done(null, user);
     })
   );
-
-  app.use(passport.initialize());
-  app.use(passport.session());
-  app.use(passport.authenticate("lnurl-auth"));
+  
   passport.serializeUser(function (user, done) {
     done(null, user.id);
   });
@@ -42,10 +54,16 @@ function setupAuth(app) {
   passport.deserializeUser(function (id, done) {
     done(null, map.user.get(id) || null);
   });
+
+  app.use(passport.authenticate("lnurl-auth"));
   
   app.get(
     "/do-login",
     function (req, res, next) {
+      if (req.user) {
+        // Already authenticated.
+        return res.redirect('/');
+      }
       next();
     },
     async function (req, res) {
@@ -55,53 +73,40 @@ function setupAuth(app) {
         // Check signature against provided linking public key.
         // This request could originate from a mobile app (ie. not their browser).
         let session;
-        assert.ok(
-          req.query.k1,
-          new HttpError('Missing required parameter: "k1"', 400)
-        );
-        assert.ok(
-          req.query.sig,
-          new HttpError('Missing required parameter: "sig"', 400)
-        );
-        assert.ok(
-          req.query.key,
-          new HttpError('Missing required parameter: "key"', 400)
-        );
-        session = map.session.get(req.query.k1);
-        assert.ok(
-          session,
-          new HttpError("Secret does not match any known session", 400)
-        );
-        const { k1, sig, key } = req.query;
-        assert.ok(
-          verifyAuthorizationSignature(sig, k1, key),
-          new HttpError("Invalid signature", 400)
-        );
-        session.lnurlAuth = session.lnurlAuth || {};
-        session.lnurlAuth.linkingPublicKey = req.query.key;
-        
-        await session.save();  
-        return res.status(200).json({ status: "OK" });
+				assert.ok(req.query.k1, new HttpError('Missing required parameter: "k1"', 400));
+				assert.ok(req.query.sig, new HttpError('Missing required parameter: "sig"', 400));
+				assert.ok(req.query.key, new HttpError('Missing required parameter: "key"', 400));
+				session = map.session.get(req.query.k1);
+				assert.ok(session, new HttpError('Secret does not match any known session', 400));
+				const { k1, sig, key } = req.query;
+				assert.ok(verifyAuthorizationSignature(sig, k1, key), new HttpError('Invalid signature', 400));
+				session.lnurlAuth = session.lnurlAuth || {};
+				session.lnurlAuth.linkingPublicKey = req.query.key;
+				// Signature check passed.
+				return new Promise((resolve, reject) => {
+					return session.save(error => {
+						if (error) return reject(error);
+						res.status(200).json({ status: 'OK' });
+						resolve();
+					});
+				});
     }
       
     req.session = req.session || {};
     req.session.lnurlAuth = req.session.lnurlAuth || {};
     let k1 = req.session.lnurlAuth.k1 || null;
     if (!k1) {
-      k1 = req.session.lnurlAuth.k1 = generateSecret(32, "hex");
+      k1 = req.session.lnurlAuth.k1 = crypto.randomBytes(32).toString('hex');
       map.session.set(k1, req.session);
     }
 
-    const params = new URLSearchParams({
-      k1,
-      tag: "login"
-    });
+    const callbackUrl = `${config.url}/do-login?` + querystring.stringify({
+			k1,
+			tag: 'login',
+		});
 
-    const callbackUrl =`https://${req.get("host")}/do-login?${params.toString()}`;
-    
     const encoded = lnurl.encode(callbackUrl).toUpperCase();
     const qrCode = await qrcode.toDataURL(encoded);
-
     return res.json({
       lnurl: encoded,
       qrCode: qrCode,
